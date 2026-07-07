@@ -22,11 +22,10 @@ pub fn init() {
         .with_writer(file_appender)
         .compact();
 
-    // 注册所有 layer
-    tracing_subscriber::registry()
+    let _ = tracing_subscriber::registry()
         .with(console_layer)
         .with(file_layer)
-        .init();
+        .try_init();
 }
 
 struct PluginWriter<W: Write>(W);

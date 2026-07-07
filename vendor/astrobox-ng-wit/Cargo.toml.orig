@@ -1,0 +1,10 @@
+[package]
+name = "astrobox-ng-wit"
+version = "0.3.1"
+edition = "2024"
+description = "WIT bindings for AstroBox NG plugin system"
+license = "MIT"
+repository = "https://github.com/AstralSightStudios/AstroBox-NG-wit-crate"
+
+[dependencies]
+wit-bindgen = { version = "0.57.1", features = ["async", "async-spawn"] }

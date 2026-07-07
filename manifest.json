@@ -1,13 +1,20 @@
 {
-    "name": "Blank Template",
+    "name": "验证推送器",
     "icon": "icon.png",
-    "version": "1.0.0",
-    "description": "一个示例 AstroBox 插件",
-    "author": "AstroBox Team",
-    "website": "https://example.com",
-    "entry": "astrobox_ng_plugin_template_rust.wasm",
+    "version": "2.0.0",
+    "description": "将 otpauth://totp URI 推送到小米手环 TOTP 快应用",
+    "author": "XinWang",
+    "website": "https://astrobox.online",
+    "entry": "miband_totp_astrobox_plugin_v2.wasm",
     "wasi_version": 2,
     "api_level": 3,
-    "permissions": ["network"],
+    "permissions": [
+        "device",
+        "dialog",
+        "clipboard",
+        "thirdpartyapp",
+        "interconnect",
+        "ui"
+    ],
     "additional_files": []
 }
