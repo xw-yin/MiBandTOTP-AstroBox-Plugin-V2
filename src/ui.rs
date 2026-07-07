@@ -13,6 +13,7 @@ const EDIT_EVENT: &str = "edit_input";
 const CLIPBOARD_EVENT: &str = "send_clipboard";
 const QR_IMAGE_EVENT: &str = "send_qr_image";
 const QUERY_COUNT_EVENT: &str = "query_wear_count";
+const BACKUP_WEAR_KEYS_EVENT: &str = "backup_wear_keys";
 const INPUT_EVENT: &str = "totp_input";
 
 #[derive(Default)]
@@ -22,6 +23,8 @@ struct UiState {
     status: String,
     busy: bool,
     install_check_started: bool,
+    pending_action: Option<String>,
+    pending_payload: Option<String>,
 }
 
 static UI_STATE: OnceLock<Mutex<UiState>> = OnceLock::new();
@@ -71,7 +74,7 @@ pub async fn ui_event_processor(event: ui::Event, event_id: String, _event_paylo
             );
         }
         ui::Event::Click => match event_id.as_str() {
-            SEND_EVENT | EDIT_EVENT | CLIPBOARD_EVENT | QR_IMAGE_EVENT | QUERY_COUNT_EVENT
+            SEND_EVENT | EDIT_EVENT | CLIPBOARD_EVENT | QR_IMAGE_EVENT | QUERY_COUNT_EVENT | BACKUP_WEAR_KEYS_EVENT
                 if is_busy() =>
             {
                 tracing::info!(
@@ -102,6 +105,10 @@ pub async fn ui_event_processor(event: ui::Event, event_id: String, _event_paylo
                 tracing::info!("dispatch click action: query wear count");
                 query_wear_account_count().await;
             }
+            BACKUP_WEAR_KEYS_EVENT => {
+                tracing::info!("dispatch click action: backup wear keys");
+                backup_wear_keys().await;
+            }
             _ => {
                 tracing::warn!("unknown click event_id={}", event_id);
             }
@@ -119,10 +126,138 @@ pub fn record_external_event(status: String) {
 pub async fn handle_interconnect_message(event_payload: String) {
     tracing::info!("handle_interconnect_message payload={}", event_payload);
 
-    if let Some(count) = extract_count_from_interconnect_payload(&event_payload) {
-        set_busy(format!("手环端账号数量：{count}"), false);
+    let parsed: Value = match serde_json::from_str(&event_payload) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+
+    let is_ready = check_is_ready(&parsed);
+    let count = find_count_value(&parsed);
+    let list = find_backup_list(&parsed);
+    let is_push_success = check_push_success(&parsed);
+
+    let pending = {
+        let state = ui_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending_action.clone()
+    };
+
+    if is_ready {
+        tracing::info!("watch app is ready, pending_action={:?}", pending);
+        if let Some(ref action) = pending {
+            {
+                let mut state = ui_state()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.pending_action = None;
+            }
+            if action == "backup" {
+                send_backup_request_message().await;
+                return;
+            } else if action == "push" {
+                send_push_payload_message().await;
+                return;
+            }
+        }
+    }
+
+    if let Some(list) = list {
+        let count = list.len();
+        let text = format_totp_list_to_text(&list);
+        set_input_text_and_status(text, format!("备份成功：已从手环导入 {count} 个账号"));
+        clear_pending_action();
+    } else if is_push_success {
+        set_busy("推送成功：手环端已接收并导入账号".to_string(), false);
+        clear_pending_action();
+    } else if let Some(count) = count {
+        if pending.is_none() {
+            set_busy(format!("手环端账号数量：{count}"), false);
+        }
     } else {
-        tracing::warn!("interconnect message did not contain account count");
+        tracing::warn!("interconnect message did not contain expected payload");
+    }
+}
+
+fn check_is_ready(value: &Value) -> bool {
+    if let Value::Object(map) = value {
+        if let Some(Value::String(action)) = map.get("action") {
+            if action == "ready" {
+                return true;
+            }
+        }
+        if let Some(Value::String(data_str)) = map.get("data") {
+            if let Ok(inner) = serde_json::from_str::<Value>(data_str) {
+                return check_is_ready(&inner);
+            }
+        }
+        for val in map.values() {
+            if check_is_ready(val) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn check_push_success(value: &Value) -> bool {
+    if let Value::Object(map) = value {
+        if let Some(Value::String(action)) = map.get("action") {
+            if action == "push_response" {
+                if let Some(Value::String(status)) = map.get("status") {
+                    return status == "success";
+                }
+            }
+        }
+        if let Some(Value::String(data_str)) = map.get("data") {
+            if let Ok(inner) = serde_json::from_str::<Value>(data_str) {
+                return check_push_success(&inner);
+            }
+        }
+        for val in map.values() {
+            if check_push_success(val) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn clear_pending_action() {
+    let mut state = ui_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    state.pending_action = None;
+    state.pending_payload = None;
+}
+
+async fn send_backup_request_message() {
+    tracing::info!("send_backup_request_message start");
+    let devices = device::get_connected_device_list().await;
+    let Some(target_device) = devices.into_iter().next() else {
+        return;
+    };
+    let request = serde_json::json!({
+        "action": "backup_request"
+    })
+    .to_string();
+    let _ = interconnect::send_qaic_message(&target_device.addr, PACKAGE_NAME, &request).await;
+}
+
+async fn send_push_payload_message() {
+    tracing::info!("send_push_payload_message start");
+    let devices = device::get_connected_device_list().await;
+    let Some(target_device) = devices.into_iter().next() else {
+        return;
+    };
+    let payload = {
+        let state = ui_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending_payload.clone()
+    };
+    if let Some(payload) = payload {
+        let _ = interconnect::send_qaic_message(&target_device.addr, PACKAGE_NAME, &payload).await;
     }
 }
 
@@ -155,9 +290,16 @@ async fn query_wear_account_count_with_msg(status_msg: &str) {
         return;
     };
 
-    match register::register_interconnect_recv(&target_device.addr, PACKAGE_NAME).await {
-        Ok(()) => tracing::info!("registered interconnect recv"),
-        Err(_) => tracing::warn!("register_interconnect_recv failed; continue querying"),
+    if let Err(_) = register::register_interconnect_recv(&target_device.addr, PACKAGE_NAME).await {
+        set_busy("监听接收失败：请确保在 AstroBox 中允许了该插件的 interconnect 权限".to_string(), false);
+        return;
+    }
+
+    {
+        let mut state = ui_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending_action = Some("query".to_string());
     }
 
     let _ = thirdpartyapp::launch_qa(&target_device.addr, &app, "pages/index").await;
@@ -175,6 +317,58 @@ async fn query_wear_account_count_with_msg(status_msg: &str) {
 
 async fn query_wear_account_count() {
     query_wear_account_count_with_msg("正在查询手环端账号数量...").await;
+}
+
+async fn backup_wear_keys() {
+    tracing::info!("backup_wear_keys start");
+    set_busy("正在连接设备并备份密钥...".to_string(), true);
+
+    let devices = device::get_connected_device_list().await;
+    let Some(target_device) = devices.into_iter().next() else {
+        set_busy("未找到已连接设备".to_string(), false);
+        return;
+    };
+
+    let apps = match thirdpartyapp::get_thirdparty_app_list(&target_device.addr).await {
+        Ok(apps) => apps,
+        Err(_) => {
+            tracing::error!("get_thirdparty_app_list failed");
+            set_busy("获取快应用列表失败".to_string(), false);
+            return;
+        }
+    };
+
+    let Some(app) = apps
+        .iter()
+        .find(|app| app.package_name == PACKAGE_NAME)
+        .cloned()
+    else {
+        set_busy("未在手环上找到验证器快应用".to_string(), false);
+        return;
+    };
+
+    if let Err(_) = register::register_interconnect_recv(&target_device.addr, PACKAGE_NAME).await {
+        set_busy("监听接收失败：请确保在 AstroBox 中允许了该插件的 interconnect 权限".to_string(), false);
+        return;
+    }
+
+    {
+        let mut state = ui_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending_action = Some("backup".to_string());
+    }
+
+    let _ = thirdpartyapp::launch_qa(&target_device.addr, &app, "pages/index").await;
+    let request = serde_json::json!({
+        "action": "backup_request"
+    })
+    .to_string();
+
+    match interconnect::send_qaic_message(&target_device.addr, PACKAGE_NAME, &request).await {
+        Ok(()) => set_busy("已发送备份请求，等待手环端回传数据...".to_string(), false),
+        Err(_) => set_busy("发送备份请求失败".to_string(), false),
+    }
 }
 
 async fn edit_input() {
@@ -392,6 +586,11 @@ async fn push_input(input: &str) {
     };
     tracing::info!("wear app found: package={}", app.package_name);
 
+    if let Err(_) = register::register_interconnect_recv(&target_device.addr, PACKAGE_NAME).await {
+        set_busy("监听接收失败：请确保在 AstroBox 中允许了该插件的 interconnect 权限".to_string(), false);
+        return;
+    }
+
     set_busy("正在启动快应用...".to_string(), true);
     let _ = thirdpartyapp::launch_qa(&target_device.addr, &app, "pages/index").await;
     tracing::info!("launch_qa requested");
@@ -409,11 +608,19 @@ async fn push_input(input: &str) {
         }
     };
 
+    {
+        let mut state = ui_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.pending_action = Some("push".to_string());
+        state.pending_payload = Some(payload.clone());
+    }
+
     set_busy("正在推送数据...".to_string(), true);
     match interconnect::send_qaic_message(&target_device.addr, PACKAGE_NAME, &payload).await {
         Ok(()) => {
             tracing::info!("send_qaic_message success: count={}", count);
-            query_wear_account_count_with_msg(&format!("发送成功，共 {count} 条。正在重新查询手环账号数量...")).await;
+            set_busy("已推送数据，等待手环确认...".to_string(), true);
         }
         Err(_) => {
             tracing::error!("send_qaic_message failed");
@@ -676,6 +883,28 @@ fn build_main_ui() -> ui::Element {
         qr_image_button = qr_image_button.disabled().opacity(0.72);
     }
 
+    let mut backup_keys_button = ui::Element::new(
+        ui::ElementType::Button,
+        Some(if busy {
+            "处理中..."
+        } else {
+            "直接从手环备份密钥"
+        }),
+    )
+    .width_full()
+    .height(56)
+    .padding(16)
+    .margin_top(10)
+    .radius(8)
+    .bg("#D97706")
+    .text_color("#FFFFFF")
+    .on(ui::Event::Click, BACKUP_WEAR_KEYS_EVENT)
+    .on(ui::Event::PointerUp, BACKUP_WEAR_KEYS_EVENT);
+
+    if busy {
+        backup_keys_button = backup_keys_button.disabled().opacity(0.72);
+    }
+
     let loaded_text = if input_chars > 0 {
         format!("当前已载入 {input_chars} 个字符。")
     } else {
@@ -708,6 +937,7 @@ fn build_main_ui() -> ui::Element {
         .child(edit_button)
         .child(clipboard_button)
         .child(qr_image_button)
+        .child(backup_keys_button)
         .child(help)
         .child(loaded)
         .child(status)
@@ -734,9 +964,87 @@ fn extract_event_value(payload: &str) -> String {
     }
 }
 
-fn extract_count_from_interconnect_payload(payload: &str) -> Option<u64> {
-    let value = serde_json::from_str::<Value>(payload).ok()?;
-    find_count_value(&value)
+fn find_backup_list(value: &Value) -> Option<Vec<TOTPInfo>> {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::String(action)) = map.get("action") {
+                if action == "backup_response" {
+                    if let Some(Value::Array(list_val)) = map.get("list") {
+                        let mut totp_list = Vec::new();
+                        for item in list_val {
+                            if let Some(info) = parse_backup_item(item) {
+                                totp_list.push(info);
+                            }
+                        }
+                        return Some(totp_list);
+                    }
+                }
+            }
+
+            if let Some(Value::String(data_str)) = map.get("data") {
+                if let Ok(inner) = serde_json::from_str::<Value>(data_str) {
+                    if let Some(list) = find_backup_list(&inner) {
+                        return Some(list);
+                    }
+                }
+            }
+
+            for val in map.values() {
+                if let Some(list) = find_backup_list(val) {
+                    return Some(list);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn parse_backup_item(item: &Value) -> Option<TOTPInfo> {
+    let obj = item.as_object()?;
+    let key = obj.get("key")?.as_str()?.to_string();
+    let name = obj.get("name")?.as_str()?.to_string();
+    let usr = obj.get("usr").and_then(Value::as_str).unwrap_or("").to_string();
+
+    Some(TOTPInfo {
+        name,
+        usr,
+        key,
+        algorithm: "SHA1".to_string(),
+        digits: 6,
+        period: 30,
+    })
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut output = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                output.push(byte as char);
+            }
+            byte => {
+                output.push_str(&format!("%{:02X}", byte));
+            }
+        }
+    }
+    output
+}
+
+fn format_totp_list_to_text(list: &[TOTPInfo]) -> String {
+    let mut lines = Vec::new();
+    for item in list {
+        let label = if item.usr.is_empty() {
+            percent_encode(&item.name)
+        } else {
+            percent_encode(&format!("{}:{}", item.name, item.usr))
+        };
+        let secret = item.key.to_uppercase();
+        let issuer = percent_encode(&item.name);
+        let uri = format!("otpauth://totp/{}?secret={}&issuer={}", label, secret, issuer);
+        lines.push(uri);
+    }
+    lines.join("\n")
 }
 
 fn find_count_value(value: &Value) -> Option<u64> {
@@ -869,6 +1177,53 @@ fn crop_and_pad_image(image: &GrayImage, quiet: u32) -> GrayImage {
 }
 
 fn parse_totp_input(input: &str) -> ParseResult {
+    let trimmed = input.trim();
+    if (trimmed.starts_with('[') && trimmed.ends_with(']')) || (trimmed.starts_with('{') && trimmed.ends_with('}')) {
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            let mut list = Vec::new();
+            let items = match value {
+                Value::Array(arr) => arr,
+                Value::Object(_) => vec![value],
+                _ => Vec::new(),
+            };
+            for item in items {
+                if let Value::Object(obj) = item {
+                    let name = obj.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+                    let usr = obj.get("usr")
+                        .map(|v| {
+                            if v.is_null() {
+                                "".to_string()
+                            } else if let Some(s) = v.as_str() {
+                                s.to_string()
+                            } else if let Some(n) = v.as_i64() {
+                                n.to_string()
+                            } else if let Some(b) = v.as_bool() {
+                                b.to_string()
+                            } else {
+                                "".to_string()
+                            }
+                        })
+                        .unwrap_or_else(|| "".to_string());
+                    let key = obj.get("key").and_then(Value::as_str).unwrap_or("").to_string();
+                    if !key.is_empty() {
+                        list.push(TOTPInfo {
+                            name,
+                            usr,
+                            key,
+                            algorithm: "SHA1".to_string(),
+                            digits: 6,
+                            period: 30,
+                        });
+                    }
+                }
+            }
+            if !list.is_empty() {
+                tracing::info!("parse_totp_input success (JSON format): count={}", list.len());
+                return ParseResult::Ok(list);
+            }
+        }
+    }
+
     let parts = split_input_entries(input);
     if parts.is_empty() {
         return ParseResult::Err("URI 为空".to_string());
