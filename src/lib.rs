@@ -22,10 +22,18 @@ impl event_v3::Guest for MyPlugin {
             event_payload
         );
 
-        if matches!(event_type, EventType::InterconnectMessage) {
-            astrobox_ng_wit::block_on(async move {
-                ui::handle_interconnect_message(event_payload).await;
-            });
+        match event_type {
+            EventType::InterconnectMessage => {
+                astrobox_ng_wit::block_on(async move {
+                    ui::handle_interconnect_message(event_payload).await;
+                });
+            }
+            EventType::Timer => {
+                astrobox_ng_wit::block_on(async move {
+                    ui::handle_timer_event(event_payload).await;
+                });
+            }
+            _ => {}
         }
 
         astrobox_ng_wit::spawn(async move {
@@ -90,6 +98,9 @@ impl lifecycle::Guest for MyPlugin {
     fn on_load() -> () {
         logger::init();
         tracing::info!("MiBand TOTP AstroBox plugin loaded");
+        astrobox_ng_wit::block_on(async {
+            ui::register_interconnect_receivers("on_load").await;
+        });
     }
 }
 

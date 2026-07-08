@@ -15,6 +15,7 @@
         "thirdpartyapp",
         "interconnect",
         "register_interconnect_recv",
+        "timer",
         "ui"
     ],
     "additional_files": []
